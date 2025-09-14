@@ -6,7 +6,6 @@
     ],
     "js": "index.js",
     "css": "style.css",
-    "author": "City-Unit",
+    "author": "宗改自City-Unit",
     "version": "1.0.0",
-    "homePage": "https://github.com/SillyTavern/SillyTavern"
 }
