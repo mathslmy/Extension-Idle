@@ -7,7 +7,7 @@ import { promptQuietForLoudResponse, sendNarratorMessage } from '../../../slash-
 import { extension_settings, getContext, renderExtensionTemplateAsync } from '../../../extensions.js';
 import { registerSlashCommand } from '../../../slash-commands.js';
 
-const extensionName = 'idle';
+const extensionName = 'third-party/Extension-Idle';
 
 let idleTimer = null;
 let repeatCount = 0;
