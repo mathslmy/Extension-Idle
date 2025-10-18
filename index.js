@@ -565,6 +565,18 @@ jQuery(async () => {
     setupAIReplyMonitor();
     
     const swReady = await initServiceWorker();
+    // 放在 const swReady = await initServiceWorker(); 之后
+// 并且在 if (swReady) { ... } 之前插入
+navigator.serviceWorker.ready.then(async (reg) => {
+  try {
+    await reg.periodicSync.register('hlh-todo-check', {
+      minInterval: 15 * 60 * 1000 // 每 15 分钟触发一次
+    });
+    toastr.success('后台周期检查已启用（每15分钟）', 'HLH-Todo SW');
+  } catch (e) {
+    toastr.warning('浏览器不支持后台周期检查', 'HLH-Todo SW');
+  }
+});
     if (swReady) {
         if (extension_settings.idle.enabled) {
             if (!extension_settings.idle.lastAIReplyTime) {
