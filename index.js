@@ -39,7 +39,7 @@ let defaultSettings = {
 const settingsHTML = `
 <div id="idle_container" class="extension-container">
     <details>
-        <summary><b>Idle</b></summary>
+        <summary><b>Idle Settings</b></summary>
         <!-- Global Settings -->
         <fieldset>
             <legend>General Settings</legend>
