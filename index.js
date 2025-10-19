@@ -164,8 +164,9 @@ function setupAIReplyMonitor() {
                     // AI message detected
                     extension_settings.idle.lastAIReplyTime = new Date().toISOString();
                     saveSettingsDebounced();
-                    console.log('[Idle Extension] AI reply detected, updating next time');
-                    updateNextTime();
+                    console.log('[Idle Extension] AI reply detected, resetting timer');
+                    // Pass true to force immediate recalculation without delay flag
+                    updateNextTime(true);
                 }
             });
         });
@@ -183,12 +184,10 @@ function setupAIReplyMonitor() {
 }
 
 // --- Unified Next Time Calculation ---
-function calculateNextTime() {
+function calculateNextTime(forceImmediate = false) {
     if (!extension_settings.idle.enabled) return null;
-
     const now = new Date();
     let candidates = [];
-
     // 1. Calculate next idle reply time
     if (extension_settings.idle.useIdleTimer) {
         const lastReply = extension_settings.idle.lastAIReplyTime 
@@ -205,19 +204,38 @@ function calculateNextTime() {
         }
         
         let nextIdleTime = new Date(lastReply.getTime() + delaySeconds * 1000);
-        
-        // Check if the calculated time is in the past
         let isDelayed = false;
-        if (nextIdleTime < now) {
-            console.log('[Idle Extension] Idle reply time is in the past, scheduling for 30s from now with delay prompt');
-            nextIdleTime = new Date(now.getTime() + 10000); // 30 seconds from now
+        
+        // 🔥 关键修复：明确检查是否超时
+        const timeSinceLastReply = (now - lastReply) / 1000;
+        
+        if (!forceImmediate && timeSinceLastReply > delaySeconds) {
+            // 已经超时！
+            const overdueSeconds = Math.floor(timeSinceLastReply - delaySeconds);
+            console.log(`[Idle Extension] ⚠️ OVERDUE by ${overdueSeconds}s - marking as DELAYED`);
+            
+            // 5秒后触发延迟消息
+            nextIdleTime = new Date(now.getTime() + 10000);
             isDelayed = true;
         }
         
         candidates.push({
             time: nextIdleTime,
             type: 'idle_reply',
-            data: { isDelayed }
+            data: { 
+                isDelayed: isDelayed,
+                lastReplyTime: lastReply.toISOString(),
+                calculatedDelay: delaySeconds,
+                actualTimeSinceReply: Math.floor(timeSinceLastReply)
+            }
+        });
+        
+        console.log('[Idle Extension] Calculated idle reply:', {
+            lastReply: lastReply.toLocaleString(),
+            timeSinceReply: `${Math.floor(timeSinceLastReply)}s`,
+            expectedDelay: `${delaySeconds}s`,
+            nextTime: nextIdleTime.toLocaleString(),
+            isDelayed: isDelayed
         });
     }
 
@@ -242,7 +260,6 @@ function calculateNextTime() {
             const target = new Date();
             target.setHours(h, m, 0, 0);
             
-            // If time has passed today, schedule for tomorrow
             if (target <= now) {
                 target.setDate(target.getDate() + 1);
             }
@@ -259,12 +276,18 @@ function calculateNextTime() {
     if (candidates.length === 0) return null;
     
     candidates.sort((a, b) => a.time - b.time);
+    
+    console.log('[Idle Extension] All candidates:', candidates.map(c => ({
+        type: c.type,
+        time: c.time.toLocaleString(),
+        isDelayed: c.data?.isDelayed
+    })));
+    
     return candidates[0];
 }
-
 // --- Update Next Time ---
-async function updateNextTime() {
-    const nextEvent = calculateNextTime();
+async function updateNextTime(forceImmediate = false) {
+    const nextEvent = calculateNextTime(forceImmediate);
     
     if (!nextEvent) {
         $('#idle_next_time').text('--');
@@ -273,7 +296,10 @@ async function updateNextTime() {
     }
 
     const { time, type, data } = nextEvent;
-    $('#idle_next_time').text(time.toLocaleString());
+    
+    // 显示时间,如果是延迟的,添加标记
+    const timeStr = time.toLocaleString();
+    $('#idle_next_time').text(data?.isDelayed ? `${timeStr} (延迟)` : timeStr);
     
     const delayMs = time.getTime() - Date.now();
     
@@ -284,7 +310,7 @@ async function updateNextTime() {
         eventData: data
     });
     
-    console.log(`[Idle Extension] Next event: ${type} at ${time.toLocaleString()}`);
+    console.log(`[Idle Extension] Next event: ${type} at ${time.toLocaleString()}`, data?.isDelayed ? '(DELAYED)' : '');
 }
 
 // --- Time Formatting ---
@@ -369,6 +395,10 @@ async function loadSettings() {
             extension_settings.idle[key] = value;
         }
     }
+    
+    // 重要: 不要在这里重新初始化 lastAIReplyTime
+    // 如果设置中已经有值,保留它
+    
     populateUIWithSettings();
 }
 
@@ -419,10 +449,14 @@ async function handleIdleEnabled() {
         $('#idle_next_time').text('--');
         toastr.warning('Idle Extension: Disabled');
     } else {
-        // Initialize last reply time if not set
+        // 只在没有保存时间时才初始化
         if (!extension_settings.idle.lastAIReplyTime) {
+            console.log('[Idle Extension] Enabling idle, initializing lastAIReplyTime');
             extension_settings.idle.lastAIReplyTime = new Date().toISOString();
             saveSettingsDebounced();
+        } else {
+            console.log('[Idle Extension] Enabling idle, using saved lastAIReplyTime:', 
+                new Date(extension_settings.idle.lastAIReplyTime).toLocaleString());
         }
         await updateNextTime();
         toastr.success('Idle Extension: Enabled');
@@ -565,24 +599,53 @@ jQuery(async () => {
     setupAIReplyMonitor();
     
     const swReady = await initServiceWorker();
-    // 放在 const swReady = await initServiceWorker(); 之后
-// 并且在 if (swReady) { ... } 之前插入
-navigator.serviceWorker.ready.then(async (reg) => {
-  try {
-    await reg.periodicSync.register('hlh-todo-check', {
-      minInterval: 15 * 60 * 1000 // 每 15 分钟触发一次
+    
+    navigator.serviceWorker.ready.then(async (reg) => {
+        try {
+            await reg.periodicSync.register('hlh-todo-check', {
+                minInterval: 15 * 60 * 1000
+            });
+            toastr.success('后台周期检查已启用（每15分钟）', 'HLH-Todo SW');
+        } catch (e) {
+            toastr.warning('浏览器不支持后台周期检查', 'HLH-Todo SW');
+        }
     });
-    toastr.success('后台周期检查已启用（每15分钟）', 'HLH-Todo SW');
-  } catch (e) {
-    toastr.warning('浏览器不支持后台周期检查', 'HLH-Todo SW');
-  }
-});
+    
     if (swReady) {
         if (extension_settings.idle.enabled) {
+            // 检查是否有保存的 lastAIReplyTime
             if (!extension_settings.idle.lastAIReplyTime) {
+                console.log('[Idle Extension] No saved lastAIReplyTime, initializing to now');
                 extension_settings.idle.lastAIReplyTime = new Date().toISOString();
                 saveSettingsDebounced();
+            } else {
+                const lastReply = new Date(extension_settings.idle.lastAIReplyTime);
+                const now = new Date();
+                const timeSinceLastReply = (now - lastReply) / 1000;
+                
+                console.log(`[Idle Extension] Restored lastAIReplyTime: ${lastReply.toLocaleString()}`);
+                console.log(`[Idle Extension] Time since last AI reply: ${timeSinceLastReply.toFixed(0)} seconds`);
+                
+                // 🔥 关键修复：检查是否应该立即触发延迟消息
+                const timerSeconds = extension_settings.idle.randomTime 
+                    ? parseInt(extension_settings.idle.timer) 
+                    : parseInt(extension_settings.idle.timer);
+                
+                if (timeSinceLastReply > timerSeconds) {
+                    // 已经超时了，应该立即触发延迟消息
+                    console.log('[Idle Extension] ⚠️ OVERDUE detected on startup! Triggering delayed message immediately');
+                    toastr.warning(`Idle Extension: 消息延迟了 ${Math.floor(timeSinceLastReply - timerSeconds)} 秒`);
+                    
+                    // 立即发送延迟消息
+                    setTimeout(() => {
+                        sendIdlePrompt('', null, true);
+                    }, 10000); // 3秒后发送，给UI时间加载
+                    
+                    return; // 不要调用 updateNextTime，因为我们已经手动触发了
+                }
             }
+            
+            // 正常情况下更新下次时间
             await updateNextTime();
             toastr.info('Idle Extension: Initialized');
         }
