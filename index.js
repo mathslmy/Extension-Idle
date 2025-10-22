@@ -114,7 +114,7 @@ const settingsHTML = `
 // --- Service Worker Communication ---
 async function initServiceWorker() {
     try {
-        const registration = await navigator.serviceWorker.getRegistration('/hlh-todo-sw.js');
+        const registration = await navigator.serviceWorker.getRegistration('./hlh-todo-sw.js');
         if (!registration) {
             toastr.error('Idle Extension: Service Worker not found. Please register hlh-todo-sw.js first.');
             return false;
