@@ -8,7 +8,6 @@ import { extension_settings, getContext } from '../../../extensions.js';
 import { registerSlashCommand } from '../../../slash-commands.js';
 
 const extensionName = 'third-party/Extension-Idle';
-let serviceWorkerReady = false;
 
 let defaultSettings = {
     enabled: false,
@@ -39,7 +38,24 @@ let defaultSettings = {
 const settingsHTML = `
 <div id="idle_container" class="extension-container">
     <details>
-        <summary><b>Idle Settings</b></summary>
+        <summary><b>Idle Settings (Termux Backend Mode)</b></summary>
+        
+        <!-- 后端状态显示 -->
+        <fieldset style="border: 2px solid #4a90e2; margin-bottom: 10px;">
+            <legend style="font-weight: bold; color: #4a90e2;">🔧 后端服务状态</legend>
+            <div style="padding: 10px;">
+                <div id="idle_backend_status" style="font-size: 14px; padding: 5px; color: #999;">
+                    未连接
+                </div>
+                <button type="button" id="idle_reconnect_backend" style="margin-top: 5px; padding: 5px 10px;">
+                    重新连接
+                </button>
+                <button type="button" id="idle_test_notification" style="margin-left: 5px; padding: 5px 10px;">
+                    测试通知
+                </button>
+            </div>
+        </fieldset>
+        
         <!-- Global Settings -->
         <fieldset>
             <legend>General Settings</legend>
@@ -111,68 +127,219 @@ const settingsHTML = `
 </div>
 `;
 
-// --- Service Worker Communication ---
-async function initServiceWorker() {
-    try {
-        const registration = await navigator.serviceWorker.getRegistration('./hlh-todo-sw.js');
-        if (!registration) {
-            toastr.error('Idle Extension: Service Worker not found. Please register hlh-todo-sw.js first.');
-            return false;
+// ========================================
+// === 后端客户端（核心通信逻辑）===
+// ========================================
+
+class IdleBackendClient {
+    constructor() {
+        this.eventSource = null;
+        this.isConnected = false;
+        this.backendUrl = 'http://localhost:8765';
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 999;
+    }
+
+    connect() {
+        if (this.eventSource) {
+            this.eventSource.close();
         }
 
-        await navigator.serviceWorker.ready;
-        serviceWorkerReady = true;
-        toastr.success('Idle Extension: Service Worker connected successfully');
-        return true;
-    } catch (error) {
-        console.error('Failed to initialize service worker:', error);
-        toastr.error('Idle Extension: Failed to connect to Service Worker');
-        return false;
-    }
-}
+        console.log('[Idle Backend] Connecting to', this.backendUrl);
+        toastr.info('正在连接后端服务...', 'Idle Extension');
 
-async function sendServiceWorkerMessage(type, data) {
-    if (!serviceWorkerReady) {
-        console.error('Service Worker not ready');
-        toastr.warning('Idle Extension: Service Worker not ready, retrying...');
-        await initServiceWorker();
-        if (!serviceWorkerReady) return null;
-    }
+        this.eventSource = new EventSource(`${this.backendUrl}/events`);
 
-    return new Promise((resolve) => {
-        const channel = new MessageChannel();
-        channel.port1.onmessage = (event) => {
-            resolve(event.data);
+        this.eventSource.onopen = () => {
+            console.log('[Idle Backend] ✓ Connected');
+            this.isConnected = true;
+            this.reconnectAttempts = 0;
+            toastr.success('后端服务已连接 - 支持息屏通知', 'Idle Extension');
+            $('#idle_backend_status').html('✓ 后端运行中').css('color', '#4a90e2');
         };
-        
-        navigator.serviceWorker.controller?.postMessage({
-            type,
-            data: { ...data, source: 'idle-extension' }
-        }, [channel.port2]);
-    });
+
+        this.eventSource.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                this.handleMessage(message);
+            } catch (err) {
+                console.error('[Idle Backend] Parse error:', err);
+            }
+        };
+
+        this.eventSource.onerror = (err) => {
+            console.error('[Idle Backend] Connection error');
+            this.isConnected = false;
+            $('#idle_backend_status').html('✗ 后端断开').css('color', '#999');
+            
+            this.eventSource.close();
+            this.attemptReconnect();
+        };
+    }
+
+    attemptReconnect() {
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            toastr.error('无法连接到后端服务，请运行: ./idle-service.sh start', 'Idle Extension');
+            return;
+        }
+
+        this.reconnectAttempts++;
+        console.log(`[Idle Backend] Reconnecting... (${this.reconnectAttempts})`);
+
+        setTimeout(() => {
+            this.connect();
+        }, 5000);
+    }
+
+    handleMessage(message) {
+    console.log('[Idle Backend] Message:', message.type);
+    switch (message.type) {
+        case 'CONNECTED':
+            console.log('[Idle Backend] Initial state received');
+            if (message.data.nextTrigger) {
+                this.updateNextTimeUI(message.data.nextTrigger);
+            }
+            break;
+        case 'NEXT_TIME_UPDATE':
+            // 定期更新显示
+            if (message.data.remainingSeconds !== undefined) {
+                const remaining = message.data.remainingSeconds;
+                const nextTime = new Date(message.data.nextTriggerTime);
+                const timeStr = nextTime.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+                $('#idle_next_time').html(`${timeStr} <span style="color: #666;">(${remaining}秒后)</span>`);
+            }
+            break;
+        case 'IDLE_TRIGGER':
+            console.log('[Idle Backend] ⏰ Idle triggered by backend!');
+            toastr.warning('后端触发空闲消息', 'Idle Extension');
+            sendIdlePrompt('', null, message.data.isDelayed);
+            
+            // 清空显示
+            $('#idle_next_time').text('等待 AI 回复...');
+            break;
+        case 'SCHEDULE_ONCE_TRIGGER':
+            console.log('[Idle Backend] ⏰ Once schedule triggered!');
+            handleOnceSchedule(message.data.index, message.data.prompt);
+            break;
+        case 'SCHEDULE_DAILY_TRIGGER':
+            console.log('[Idle Backend] ⏰ Daily schedule triggered!');
+            handleDailySchedule(message.data.index, message.data.prompt);
+            break;
+        case 'SETTINGS_UPDATED':
+            console.log('[Idle Backend] Settings synced from backend');
+            break;
+        case 'AI_REPLY_DETECTED':
+            console.log('[Idle Backend] AI reply detected by backend');
+            break;
+    }
 }
 
-// --- Monitor AI Replies ---
+    
+
+    async syncSettings(settings) {
+        if (!this.isConnected) {
+            console.warn('[Idle Backend] Not connected, cannot sync settings');
+            return;
+        }
+
+        try {
+            const response = await fetch(`${this.backendUrl}/api/settings`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            });
+
+            if (response.ok) {
+                console.log('[Idle Backend] Settings synced');
+            }
+        } catch (err) {
+            console.error('[Idle Backend] Failed to sync settings:', err);
+        }
+    }
+
+    async notifyAIReply() {
+        if (!this.isConnected) {
+            console.warn('[Idle Backend] Not connected, cannot notify AI reply');
+            return;
+        }
+
+        try {
+            const response = await fetch(`${this.backendUrl}/api/ai-reply`, {
+                method: 'POST'
+            });
+
+            if (response.ok) {
+                console.log('[Idle Backend] AI reply notified to backend');
+            }
+        } catch (err) {
+            console.error('[Idle Backend] Failed to notify AI reply:', err);
+        }
+    }
+
+    async testNotification() {
+        if (!this.isConnected) {
+            toastr.error('后端未连接', 'Idle Extension');
+            return;
+        }
+
+        try {
+            // 临时设置一个很短的触发时间
+            const testSettings = {
+                ...extension_settings.idle,
+                enabled: true,
+                lastAIReplyTime: new Date(Date.now() - 1000).toISOString(), // 1秒前
+                timer: 0 // 立即触发
+            };
+
+            await this.syncSettings(testSettings);
+            toastr.success('测试通知已发送到后端，请查看手机', 'Idle Extension');
+
+            // 2秒后恢复正常设置
+            setTimeout(async () => {
+                await this.syncSettings(extension_settings.idle);
+            }, 2000);
+        } catch (err) {
+            toastr.error('测试失败：' + err.message, 'Idle Extension');
+        }
+    }
+
+    disconnect() {
+        if (this.eventSource) {
+            this.eventSource.close();
+            this.eventSource = null;
+        }
+        this.isConnected = false;
+    }
+}
+
+// 全局后端客户端实例
+let idleBackendClient = null;
+
+// ========================================
+// === AI 回复监听器 ===
+// ========================================
+
 function setupAIReplyMonitor() {
-    // Monitor for AI message generation completion
     const observer = new MutationObserver((mutations) => {
         mutations.forEach((mutation) => {
             mutation.addedNodes.forEach((node) => {
-                // Check if this is an AI message
                 if (node.classList && node.classList.contains('mes') && 
                     !node.classList.contains('user_mes')) {
-                    // AI message detected
+                    
+                    // 更新本地设置
                     extension_settings.idle.lastAIReplyTime = new Date().toISOString();
                     saveSettingsDebounced();
-                    console.log('[Idle Extension] AI reply detected, resetting timer');
-                    // Pass true to force immediate recalculation without delay flag
-                    updateNextTime(true);
+                    
+                    // 通知后端
+                    if (idleBackendClient && idleBackendClient.isConnected) {
+                        idleBackendClient.notifyAIReply();
+                        console.log('[Idle Extension] AI reply detected, notified backend');
+                    }
                 }
             });
         });
     });
 
-    // Observe the chat container
     const chatContainer = document.getElementById('chat');
     if (chatContainer) {
         observer.observe(chatContainer, {
@@ -183,137 +350,10 @@ function setupAIReplyMonitor() {
     }
 }
 
-// --- Unified Next Time Calculation ---
-function calculateNextTime(forceImmediate = false) {
-    if (!extension_settings.idle.enabled) return null;
-    const now = new Date();
-    let candidates = [];
-    // 1. Calculate next idle reply time
-    if (extension_settings.idle.useIdleTimer) {
-        const lastReply = extension_settings.idle.lastAIReplyTime 
-            ? new Date(extension_settings.idle.lastAIReplyTime) 
-            : now;
-        
-        let delaySeconds;
-        if (extension_settings.idle.randomTime) {
-            const min = parseInt(extension_settings.idle.timerMin);
-            const max = parseInt(extension_settings.idle.timer);
-            delaySeconds = Math.floor(Math.random() * (max - min + 1)) + min;
-        } else {
-            delaySeconds = parseInt(extension_settings.idle.timer);
-        }
-        
-        let nextIdleTime = new Date(lastReply.getTime() + delaySeconds * 1000);
-        let isDelayed = false;
-        
-        // 🔥 关键修复：明确检查是否超时
-        const timeSinceLastReply = (now - lastReply) / 1000;
-        
-        if (!forceImmediate && timeSinceLastReply > delaySeconds) {
-            // 已经超时！
-            const overdueSeconds = Math.floor(timeSinceLastReply - delaySeconds);
-            console.log(`[Idle Extension] ⚠️ OVERDUE by ${overdueSeconds}s - marking as DELAYED`);
-            
-            // 5秒后触发延迟消息
-            nextIdleTime = new Date(now.getTime() + 10000);
-            isDelayed = true;
-        }
-        
-        candidates.push({
-            time: nextIdleTime,
-            type: 'idle_reply',
-            data: { 
-                isDelayed: isDelayed,
-                lastReplyTime: lastReply.toISOString(),
-                calculatedDelay: delaySeconds,
-                actualTimeSinceReply: Math.floor(timeSinceLastReply)
-            }
-        });
-        
-        console.log('[Idle Extension] Calculated idle reply:', {
-            lastReply: lastReply.toLocaleString(),
-            timeSinceReply: `${Math.floor(timeSinceLastReply)}s`,
-            expectedDelay: `${delaySeconds}s`,
-            nextTime: nextIdleTime.toLocaleString(),
-            isDelayed: isDelayed
-        });
-    }
+// ========================================
+// === 其他函数（保持不变）===
+// ========================================
 
-    // 2. Calculate one-time schedules
-    extension_settings.idle.scheduleOnceList.forEach((item, index) => {
-        if (item.enabled && item.time) {
-            const target = new Date(item.time);
-            if (target > now) {
-                candidates.push({
-                    time: target,
-                    type: 'once',
-                    data: { index, prompt: item.prompt }
-                });
-            }
-        }
-    });
-
-    // 3. Calculate daily schedules
-    extension_settings.idle.scheduleDailyList.forEach((item, index) => {
-        if (item.enabled && item.time) {
-            const [h, m] = item.time.split(':').map(Number);
-            const target = new Date();
-            target.setHours(h, m, 0, 0);
-            
-            if (target <= now) {
-                target.setDate(target.getDate() + 1);
-            }
-            
-            candidates.push({
-                time: target,
-                type: 'daily',
-                data: { index, prompt: item.prompt }
-            });
-        }
-    });
-
-    // Find the earliest time
-    if (candidates.length === 0) return null;
-    
-    candidates.sort((a, b) => a.time - b.time);
-    
-    console.log('[Idle Extension] All candidates:', candidates.map(c => ({
-        type: c.type,
-        time: c.time.toLocaleString(),
-        isDelayed: c.data?.isDelayed
-    })));
-    
-    return candidates[0];
-}
-// --- Update Next Time ---
-async function updateNextTime(forceImmediate = false) {
-    const nextEvent = calculateNextTime(forceImmediate);
-    
-    if (!nextEvent) {
-        $('#idle_next_time').text('--');
-        await sendServiceWorkerMessage('CANCEL_UNIFIED_TIMER', {});
-        return;
-    }
-
-    const { time, type, data } = nextEvent;
-    
-    // 显示时间,如果是延迟的,添加标记
-    const timeStr = time.toLocaleString();
-    $('#idle_next_time').text(data?.isDelayed ? `${timeStr} (延迟)` : timeStr);
-    
-    const delayMs = time.getTime() - Date.now();
-    
-    await sendServiceWorkerMessage('SCHEDULE_UNIFIED_TIMER', {
-        fireAt: time.getTime(),
-        delayMs: delayMs,
-        eventType: type,
-        eventData: data
-    });
-    
-    console.log(`[Idle Extension] Next event: ${type} at ${time.toLocaleString()}`, data?.isDelayed ? '(DELAYED)' : '');
-}
-
-// --- Time Formatting ---
 function getFullTimestamp() {
     const now = new Date();
     return now.getFullYear() + '-' +
@@ -324,14 +364,11 @@ function getFullTimestamp() {
         String(now.getSeconds()).padStart(2, '0');
 }
 
-// --- Send Idle Prompt ---
 async function sendIdlePrompt(customPrompt = '', sendAsOverride = null, isDelayed = false) {
     if (!extension_settings.idle.enabled) return;
 
     if ($('#mes_stop').is(':visible')) {
-        // AI is currently generating, reschedule
-        console.log('[Idle Extension] AI is generating, rescheduling...');
-        setTimeout(() => updateNextTime(), 5000);
+        console.log('[Idle Extension] AI is generating, skip');
         return;
     }
 
@@ -342,7 +379,6 @@ async function sendIdlePrompt(customPrompt = '', sendAsOverride = null, isDelaye
         ];
     }
 
-    // Add delayed message if applicable
     if (isDelayed) {
         const delayedMessage = substituteParams('{{char}}之前的信息没发出去，需要告诉{{user}}');
         promptToSend = delayedMessage + ' ' + promptToSend;
@@ -365,27 +401,19 @@ async function sendIdlePrompt(customPrompt = '', sendAsOverride = null, isDelaye
     }
 
     toastr.info(`Idle Extension: Sent ${isDelayed ? 'delayed ' : ''}prompt as ${sendAsValue}`);
-    
-    // Don't update lastAIReplyTime here - wait for actual AI response
-    // Next time will be recalculated after AI responds
 }
 
-// --- Handle One-Time Schedule ---
 async function handleOnceSchedule(index, prompt) {
     await sendIdlePrompt(prompt || '', 'char', false);
-    
-    // Disable this schedule
     extension_settings.idle.scheduleOnceList[index].enabled = false;
     saveSettingsDebounced();
     renderSchedules();
 }
 
-// --- Handle Daily Schedule ---
 async function handleDailySchedule(index, prompt) {
     await sendIdlePrompt(prompt || '', 'char', false);
 }
 
-// --- Load Settings ---
 async function loadSettings() {
     if (!extension_settings.idle) {
         extension_settings.idle = {};
@@ -395,14 +423,9 @@ async function loadSettings() {
             extension_settings.idle[key] = value;
         }
     }
-    
-    // 重要: 不要在这里重新初始化 lastAIReplyTime
-    // 如果设置中已经有值,保留它
-    
     populateUIWithSettings();
 }
 
-// --- Populate UI ---
 function populateUIWithSettings() {
     $('#idle_timer').val(extension_settings.idle.timer).trigger('input');
     $('#idle_prompts').val(extension_settings.idle.prompts.join('\n')).trigger('input');
@@ -415,13 +438,11 @@ function populateUIWithSettings() {
     renderSchedules();
 }
 
-// --- Load Settings HTML ---
 async function loadSettingsHTML() {
     const getContainer = () => $(document.getElementById('idle_container') ?? document.getElementById('extensions_settings2'));
     getContainer().append(settingsHTML);
 }
 
-// --- Update Setting ---
 function updateSetting(elementId, property, isCheckbox = false) {
     let value = $(`#${elementId}`).val();
     if (isCheckbox) {
@@ -434,36 +455,35 @@ function updateSetting(elementId, property, isCheckbox = false) {
     saveSettingsDebounced();
 }
 
-// --- Attach Listener ---
 function attachUpdateListener(elementId, property, isCheckbox = false) {
     $(`#${elementId}`).on('input', debounce(async () => {
         updateSetting(elementId, property, isCheckbox);
-        await updateNextTime();
+        
+        // 同步到后端
+        if (idleBackendClient && idleBackendClient.isConnected) {
+            await idleBackendClient.syncSettings(extension_settings.idle);
+        }
     }, 250));
 }
 
-// --- Handle Enabled ---
 async function handleIdleEnabled() {
     if (!extension_settings.idle.enabled) {
-        await sendServiceWorkerMessage('CANCEL_UNIFIED_TIMER', {});
         $('#idle_next_time').text('--');
         toastr.warning('Idle Extension: Disabled');
     } else {
-        // 只在没有保存时间时才初始化
         if (!extension_settings.idle.lastAIReplyTime) {
-            console.log('[Idle Extension] Enabling idle, initializing lastAIReplyTime');
             extension_settings.idle.lastAIReplyTime = new Date().toISOString();
             saveSettingsDebounced();
-        } else {
-            console.log('[Idle Extension] Enabling idle, using saved lastAIReplyTime:', 
-                new Date(extension_settings.idle.lastAIReplyTime).toLocaleString());
         }
-        await updateNextTime();
         toastr.success('Idle Extension: Enabled');
+    }
+    
+    // 同步到后端
+    if (idleBackendClient && idleBackendClient.isConnected) {
+        await idleBackendClient.syncSettings(extension_settings.idle);
     }
 }
 
-// --- Setup Listeners ---
 function setupListeners() {
     const settingsToWatch = [
         ['idle_timer', 'timer'],
@@ -481,9 +501,21 @@ function setupListeners() {
     });
 
     $('#idle_enabled').on('input', debounce(handleIdleEnabled, 250));
+    
+    // 后端控制按钮
+    $('#idle_reconnect_backend').on('click', () => {
+        if (idleBackendClient) {
+            idleBackendClient.connect();
+        }
+    });
+    
+    $('#idle_test_notification').on('click', async () => {
+        if (idleBackendClient) {
+            await idleBackendClient.testNotification();
+        }
+    });
 }
 
-// --- Toggle Idle ---
 function toggleIdle() {
     extension_settings.idle.enabled = !extension_settings.idle.enabled;
     $('#idle_enabled').prop('checked', extension_settings.idle.enabled);
@@ -491,7 +523,6 @@ function toggleIdle() {
     toastr.info(`Idle mode ${extension_settings.idle.enabled ? 'enabled' : 'disabled'}.`);
 }
 
-// --- Render Schedules ---
 function renderSchedules() {
     const onceList = $('#idle_schedule_once_list').empty();
     extension_settings.idle.scheduleOnceList.forEach((item, index) => {
@@ -518,14 +549,16 @@ function renderSchedules() {
     });
 }
 
-// --- Setup Schedule Listeners ---
 async function setupScheduleListeners() {
     $('#idle_add_schedule_once').on('click', async () => {
         extension_settings.idle.scheduleOnceList.push({ enabled: true, time: '', prompt: '' });
         saveSettingsDebounced();
         renderSchedules();
         toastr.success('Idle Extension: Added one-time schedule');
-        await updateNextTime();
+        
+        if (idleBackendClient && idleBackendClient.isConnected) {
+            await idleBackendClient.syncSettings(extension_settings.idle);
+        }
     });
 
     $('#idle_add_schedule_daily').on('click', async () => {
@@ -533,7 +566,10 @@ async function setupScheduleListeners() {
         saveSettingsDebounced();
         renderSchedules();
         toastr.success('Idle Extension: Added daily schedule');
-        await updateNextTime();
+        
+        if (idleBackendClient && idleBackendClient.isConnected) {
+            await idleBackendClient.syncSettings(extension_settings.idle);
+        }
     });
 
     $('#idle_schedule_once_list').on('input change click', '.schedule-entry', async function(e) {
@@ -548,7 +584,10 @@ async function setupScheduleListeners() {
             toastr.warning('Idle Extension: Removed one-time schedule');
         }
         saveSettingsDebounced();
-        await updateNextTime();
+        
+        if (idleBackendClient && idleBackendClient.isConnected) {
+            await idleBackendClient.syncSettings(extension_settings.idle);
+        }
     });
 
     $('#idle_schedule_daily_list').on('input change click', '.schedule-entry', async function(e) {
@@ -563,95 +602,43 @@ async function setupScheduleListeners() {
             toastr.warning('Idle Extension: Removed daily schedule');
         }
         saveSettingsDebounced();
-        await updateNextTime();
+        
+        if (idleBackendClient && idleBackendClient.isConnected) {
+            await idleBackendClient.syncSettings(extension_settings.idle);
+        }
     });
 }
 
-// --- Listen for Service Worker Messages ---
-navigator.serviceWorker?.addEventListener('message', async (event) => {
-    const { type, data } = event.data;
-    
-    if (type === 'UNIFIED_TIMER_FIRED') {
-        const { eventType, eventData } = data;
-        
-        if (eventType === 'idle_reply') {
-            toastr.info('Idle Extension: Idle timer fired');
-            await sendIdlePrompt('', null, eventData?.isDelayed || false);
-        } else if (eventType === 'once') {
-            toastr.info('Idle Extension: One-time schedule triggered');
-            await handleOnceSchedule(eventData.index, eventData.prompt);
-        } else if (eventType === 'daily') {
-            toastr.info('Idle Extension: Daily schedule triggered');
-            await handleDailySchedule(eventData.index, eventData.prompt);
-        }
-    }
-});
+// ========================================
+// === 初始化 ===
+// ========================================
 
-// --- Init ---
 jQuery(async () => {
+    console.log('[Idle Extension] Initializing (Backend-Only Mode)...');
+    
     await loadSettingsHTML();
     loadSettings();
     setupListeners();
     setupScheduleListeners();
     renderSchedules();
-    
-    // Setup AI reply monitor
     setupAIReplyMonitor();
     
-    const swReady = await initServiceWorker();
+    // 连接后端服务
+    idleBackendClient = new IdleBackendClient();
+    idleBackendClient.connect();
     
-    navigator.serviceWorker.ready.then(async (reg) => {
-        try {
-            await reg.periodicSync.register('hlh-todo-check', {
-                minInterval: 15 * 60 * 1000
-            });
-            toastr.success('后台周期检查已启用（每15分钟）', 'HLH-Todo SW');
-        } catch (e) {
-            toastr.warning('浏览器不支持后台周期检查', 'HLH-Todo SW');
-        }
-    });
+    // 等待连接
+    await new Promise(resolve => setTimeout(resolve, 2000));
     
-    if (swReady) {
-        if (extension_settings.idle.enabled) {
-            // 检查是否有保存的 lastAIReplyTime
-            if (!extension_settings.idle.lastAIReplyTime) {
-                console.log('[Idle Extension] No saved lastAIReplyTime, initializing to now');
-                extension_settings.idle.lastAIReplyTime = new Date().toISOString();
-                saveSettingsDebounced();
-            } else {
-                const lastReply = new Date(extension_settings.idle.lastAIReplyTime);
-                const now = new Date();
-                const timeSinceLastReply = (now - lastReply) / 1000;
-                
-                console.log(`[Idle Extension] Restored lastAIReplyTime: ${lastReply.toLocaleString()}`);
-                console.log(`[Idle Extension] Time since last AI reply: ${timeSinceLastReply.toFixed(0)} seconds`);
-                
-                // 🔥 关键修复：检查是否应该立即触发延迟消息
-                const timerSeconds = extension_settings.idle.randomTime 
-                    ? parseInt(extension_settings.idle.timer) 
-                    : parseInt(extension_settings.idle.timer);
-                
-                if (timeSinceLastReply > timerSeconds) {
-                    // 已经超时了，应该立即触发延迟消息
-                    console.log('[Idle Extension] ⚠️ OVERDUE detected on startup! Triggering delayed message immediately');
-                    toastr.warning(`Idle Extension: 消息延迟了 ${Math.floor(timeSinceLastReply - timerSeconds)} 秒`);
-                    
-                    // 立即发送延迟消息
-                    setTimeout(() => {
-                        sendIdlePrompt('', null, true);
-                    }, 10000); // 3秒后发送，给UI时间加载
-                    
-                    return; // 不要调用 updateNextTime，因为我们已经手动触发了
-                }
-            }
-            
-            // 正常情况下更新下次时间
-            await updateNextTime();
-            toastr.info('Idle Extension: Initialized');
-        }
+    // 同步设置到后端
+    if (idleBackendClient.isConnected) {
+        await idleBackendClient.syncSettings(extension_settings.idle);
+        console.log('[Idle Extension] Settings synced to backend');
     } else {
-        toastr.error('Idle Extension: Service Worker initialization failed');
+        toastr.error('后端未连接！请运行: cd ~/SillyTavern && ./idle-service.sh start', 'Idle Extension', {timeOut: 10000});
     }
     
     registerSlashCommand('idle', toggleIdle, [], '– toggles idle mode', true, true);
+    
+    console.log('[Idle Extension] Initialized (Backend-Only Mode)');
 });
